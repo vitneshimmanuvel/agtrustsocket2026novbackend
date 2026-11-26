@@ -1295,23 +1295,31 @@ app.put('/api/registers/:id', async (req, res) => {
           await client.query('DELETE FROM entries WHERE register_id = $1', [regId]);
         }
 
-        for (let i = 0; i < entries.length; i++) {
-          const entry = entries[i];
-          const eId = parseBigInt(entry.id) || generateServerEntryId();
-          const rNum = Number(entry.rowNumber || entry.row_number || (i + 1));
-          const cellsJson = JSON.stringify(entry.cells || {});
-          const stylesJson = entry.cellStyles ? JSON.stringify(entry.cellStyles) : null;
-          const pIdx = Number(entry.pageIndex ?? entry.page_index ?? 0);
-
+        const CHUNK_SIZE = 250;
+        for (let offset = 0; offset < entries.length; offset += CHUNK_SIZE) {
+          const chunk = entries.slice(offset, offset + CHUNK_SIZE);
+          const valueClauses = [];
+          const params = [];
+          let p = 1;
+          for (let j = 0; j < chunk.length; j++) {
+            const entry = chunk[j];
+            const eId = parseBigInt(entry.id) || generateServerEntryId();
+            const rNum = Number(entry.rowNumber || entry.row_number || (offset + j + 1));
+            const cellsJson = JSON.stringify(entry.cells || {});
+            const stylesJson = entry.cellStyles ? JSON.stringify(entry.cellStyles) : null;
+            const pIdx = Number(entry.pageIndex ?? entry.page_index ?? 0);
+            valueClauses.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+            params.push(eId, regId, rNum, cellsJson, stylesJson, pIdx);
+          }
           await client.query(`
             INSERT INTO entries (id, register_id, row_number, cells, cell_styles, page_index)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ${valueClauses.join(', ')}
             ON CONFLICT (id) DO UPDATE SET
               row_number = EXCLUDED.row_number,
               cells = EXCLUDED.cells,
               cell_styles = EXCLUDED.cell_styles,
               page_index = EXCLUDED.page_index
-          `, [eId, regId, rNum, cellsJson, stylesJson, pIdx]);
+          `, params);
         }
 
         await client.query('UPDATE registers SET entry_count = $1 WHERE id = $2', [entries.length, regId]);
@@ -1490,7 +1498,7 @@ app.patch('/api/registers/:id/cells', async (req, res) => {
   }
 });
 
-// Linked Column Sync (target register lookup by __sourceEntryId or fallback row_number)
+// Linked Column Sync (target register lookup by __sourceEntryId or fallback row_number, auto-creates missing target row)
 app.post('/api/registers/:id/entries/sync-cell', async (req, res) => {
   try {
     const targetRegId = parseBigInt(req.params.id);
@@ -1500,7 +1508,9 @@ app.post('/api/registers/:id/entries/sync-cell', async (req, res) => {
     if (!colKey) return res.status(400).json({ error: 'Missing columnId' });
 
     const valStr = JSON.stringify(value ?? '');
-    const updatedRow = await withTransaction(async (client) => {
+    const { updatedRow, createdRow } = await withTransaction(async (client) => {
+      await client.query('SELECT id FROM registers WHERE id = $1 FOR UPDATE', [targetRegId]);
+
       let resUpdate = await client.query(`
         UPDATE entries
         SET cells = jsonb_set(COALESCE(cells, '{}'::jsonb), ARRAY[$1::text], $2::jsonb)
@@ -1520,25 +1530,72 @@ app.post('/api/registers/:id/entries/sync-cell', async (req, res) => {
           RETURNING *
         `, [colKey, valStr, targetRegId, JSON.stringify(String(sourceEntryId)), Number(rowNumber)]);
       }
-      return resUpdate.rows[0] || null;
+
+      if (resUpdate.rowCount === 0) {
+        const maxRowRes = await client.query(
+          'SELECT COALESCE(MAX(row_number), 0)::int AS max_row FROM entries WHERE register_id = $1',
+          [targetRegId]
+        );
+        const maxRow = maxRowRes.rows[0]?.max_row || 0;
+        const desiredRow = Math.max(maxRow + 1, Number(rowNumber) || (maxRow + 1));
+
+        // Create any intermediate rows if rowNumber jumps ahead, keeping alignment smooth
+        for (let r = maxRow + 1; r < desiredRow; r++) {
+          await client.query(
+            `INSERT INTO entries (id, register_id, row_number, cells, page_index)
+             VALUES ($1, $2, $3, $4, 0)`,
+            [generateServerEntryId(), targetRegId, r, JSON.stringify({})]
+          );
+        }
+
+        const newCells = {
+          [colKey]: value ?? '',
+          ...(sourceEntryId !== undefined && sourceEntryId !== null ? { __sourceEntryId: String(sourceEntryId) } : {})
+        };
+        const resInsert = await client.query(
+          `INSERT INTO entries (id, register_id, row_number, cells, page_index)
+           VALUES ($1, $2, $3, $4, 0)
+           RETURNING *`,
+          [generateServerEntryId(), targetRegId, desiredRow, JSON.stringify(newCells)]
+        );
+        await client.query(
+          'UPDATE registers SET entry_count = (SELECT COUNT(*) FROM entries WHERE register_id = $1), updated_at = NOW() WHERE id = $1',
+          [targetRegId]
+        );
+        return { updatedRow: resInsert.rows[0], createdRow: true };
+      }
+
+      await client.query('UPDATE registers SET updated_at = NOW() WHERE id = $1', [targetRegId]);
+      return { updatedRow: resUpdate.rows[0] || null, createdRow: false };
     });
 
+    let parsed = null;
     if (updatedRow) {
-      const parsed = formatEntry(updatedRow);
-      const syncCellPayload = {
-        registerId: String(targetRegId),
-        entryId: parsed.id,
-        rowNumber: parsed.rowNumber,
-        colKey,
-        value: value ?? '',
-        updatedBy: req.user?.name || 'System Link',
-        clientSessionId
-      };
-      io.to(`register:${String(targetRegId)}`).emit('cell:update', syncCellPayload);
-      await publishAblyEvent(`register:${String(targetRegId)}`, 'cell:update', syncCellPayload);
+      parsed = formatEntry(updatedRow);
+      if (createdRow) {
+        const rowAddPayload = {
+          registerId: String(targetRegId),
+          entry: parsed,
+          clientSessionId
+        };
+        io.to(`register:${String(targetRegId)}`).emit('row:add', rowAddPayload);
+        await publishAblyEvent(`register:${String(targetRegId)}`, 'row:add', rowAddPayload);
+      } else {
+        const syncCellPayload = {
+          registerId: String(targetRegId),
+          entryId: parsed.id,
+          rowNumber: parsed.rowNumber,
+          colKey,
+          value: value ?? '',
+          updatedBy: req.user?.name || 'System Link',
+          clientSessionId
+        };
+        io.to(`register:${String(targetRegId)}`).emit('cell:update', syncCellPayload);
+        await publishAblyEvent(`register:${String(targetRegId)}`, 'cell:update', syncCellPayload);
+      }
     }
 
-    res.json({ success: true, updated: !!updatedRow });
+    res.json({ success: true, updated: !!updatedRow, created: createdRow, entry: parsed });
   } catch (err) {
     console.error('[Sync Cell Error]', err);
     res.status(500).json({ error: err.message });

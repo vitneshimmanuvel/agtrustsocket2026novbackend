@@ -42,7 +42,7 @@ export function generateToken(user) {
       permissions: parsePermissions(user.permissions)
     },
     JWT_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: '30d' }
   );
 }
 
