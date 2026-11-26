@@ -1,0 +1,28 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    },
+    "api/cron/daily-backup.js": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/daily-backup",
+      "schedule": "30 13 * * *"
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/cron/daily-backup",
+      "destination": "/api/cron/daily-backup.js"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    }
+  ]
+}
