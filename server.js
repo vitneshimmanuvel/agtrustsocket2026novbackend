@@ -625,7 +625,13 @@ app.post('/api/auth/login', async (req, res) => {
         return res.status(403).json({ error: 'Account is deactivated or blocked. Contact your administrator.' });
       }
 
-      if (u.password_hash !== hashedPassword && u.password_hash !== password) {
+      const trimmedPassword = typeof password === 'string' ? password.trim() : '';
+      const trimmedHash = trimmedPassword && trimmedPassword !== password ? hashPassword(trimmedPassword) : null;
+      const passwordMatches =
+        u.password_hash === hashedPassword ||
+        u.password_hash === password ||
+        (trimmedHash !== null && (u.password_hash === trimmedHash || u.password_hash === trimmedPassword));
+      if (!passwordMatches) {
         return res.status(401).json({ error: 'Invalid username or password' });
       }
 
@@ -3018,6 +3024,17 @@ app.all('/api/cron/daily-backup', async (req, res) => {
 // ----------------------------------------------------
 async function bootstrapDatabase() {
   try {
+    // Fast-path for serverless cold starts when schema and default users are already provisioned
+    const fastCheck = await query(`
+      SELECT
+        to_regclass('public.backups') IS NOT NULL AS has_backups,
+        EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_entries_register_row') AS has_idx,
+        EXISTS (SELECT 1 FROM users LIMIT 1) AS has_users
+    `).catch(() => ({ rows: [] }));
+    if (fastCheck.rows[0]?.has_backups && fastCheck.rows[0]?.has_idx && fastCheck.rows[0]?.has_users) {
+      return;
+    }
+
     await query(`
       CREATE TABLE IF NOT EXISTS users (
         id VARCHAR(100) PRIMARY KEY,

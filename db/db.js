@@ -23,16 +23,34 @@ pool.on('error', (err) => {
 
 export async function query(text, params) {
   const start = Date.now();
-  try {
-    const res = await pool.query(text, params);
-    const duration = Date.now() - start;
-    if (duration > 2000) {
-      console.warn(`[Slow Query Warning] ${duration}ms - ${text.slice(0, 100)}`);
+  const isTransientNetErr = (err) => {
+    const msg = String(err?.message || '');
+    const code = String(err?.code || '');
+    return (
+      code === 'ECONNRESET' ||
+      code === 'ETIMEDOUT' ||
+      code === 'EPIPE' ||
+      code === '57P01' ||
+      msg.includes('ECONNRESET') ||
+      msg.includes('Connection terminated unexpectedly')
+    );
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await pool.query(text, params);
+      const duration = Date.now() - start;
+      if (duration > 2000) {
+        console.warn(`[Slow Query Warning] ${duration}ms - ${text.slice(0, 100)}`);
+      }
+      return res;
+    } catch (err) {
+      if (attempt === 1 && isTransientNetErr(err)) {
+        continue;
+      }
+      console.error('[DB Query Error]', err.message, '\nSQL:', text, '\nParams:', params);
+      throw err;
     }
-    return res;
-  } catch (err) {
-    console.error('[DB Query Error]', err.message, '\nSQL:', text, '\nParams:', params);
-    throw err;
   }
 }
 
